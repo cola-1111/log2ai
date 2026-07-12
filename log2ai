@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly LOG2AI_VERSION="0.1.0"
+readonly LOG2AI_MARKER_PREFIX="__LOG2AI_COMMAND_START__"
+readonly LOG2AI_MARKER_END="__LOG2AI_COMMAND_END__"
+
+log2ai_state_dir() {
+    echo "${XDG_STATE_HOME:-$HOME/.local/state}/log2ai"
+}
+
+log2ai_sessions_dir() {
+    echo "$(log2ai_state_dir)/sessions"
+}
+
+err() {
+    printf '%s\n' "log2ai: $*" >&2
+}
+
+die() {
+    err "$@"
+    exit 1
+}
+
+ensure_state_dirs() {
+    local state_dir sessions_dir
+    state_dir="$(log2ai_state_dir)"
+    sessions_dir="$(log2ai_sessions_dir)"
+
+    if ! mkdir -p "$sessions_dir" 2>/dev/null; then
+        die "Cannot create log directory: $sessions_dir"
+    fi
+    chmod 700 "$state_dir" 2>/dev/null || true
+    chmod 700 "$sessions_dir" 2>/dev/null || true
+}
+
+check_wsl2() {
+    if [[ ! -f /proc/version ]]; then
+        die "Cannot detect environment. /proc/version not found."
+    fi
+    if ! grep -qi "microsoft\|wsl" /proc/version 2>/dev/null; then
+        die "log2ai requires WSL2. Current environment does not appear to be WSL."
+    fi
+}
+
+
+check_clip_exe() {
+    if ! command -v clip.exe >/dev/null 2>&1; then
+        die "clip.exe not found. Ensure WSL interop is enabled and Windows system32 is in PATH.
+Try: export PATH=\"\$PATH:/mnt/c/Windows/System32\""
+    fi
+}
+
+validate_session_id() {
+    local sid="$1"
+    if [[ ! "$sid" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
+        die "Invalid session ID format: $sid"
+    fi
+}
+
+resolve_session_id() {
+    local session_id="${1:-}"
+    local sessions_dir
+
+    sessions_dir="$(log2ai_sessions_dir)"
+
+    if [[ -n "$session_id" ]]; then
+        validate_session_id "$session_id"
+        echo "$session_id"
+        return
+    fi
+
+    local latest_file
+    latest_file="$(log2ai_state_dir)/latest"
+
+    if [[ ! -f "$latest_file" ]]; then
+        die "No sessions found. Start one with: log2ai start"
+    fi
+
+    session_id="$(cat "$latest_file" 2>/dev/null)" || die "Cannot read latest session file."
+
+    if [[ -z "$session_id" ]]; then
+        die "Latest session file is empty. Start a new session with: log2ai start"
+    fi
+
+    validate_session_id "$session_id"
+    echo "$session_id"
+}
+
+get_log_file() {
+    local session_id="$1"
+    local sessions_dir
+    sessions_dir="$(log2ai_sessions_dir)"
+    local log_file="$sessions_dir/$session_id.log"
+
+    local real_log real_sessions
+    real_log="$(realpath "$log_file" 2>/dev/null || echo "$log_file")"
+    real_sessions="$(realpath "$sessions_dir" 2>/dev/null || echo "$sessions_dir")"
+
+    if [[ "$real_log" != "$real_sessions"/* ]]; then
+        die "Invalid log file path (path traversal detected)."
+    fi
+
+    echo "$log_file"
+}
+
+get_meta_file() {
+    local session_id="$1"
+    echo "$(log2ai_sessions_dir)/$session_id.meta"
+}
+
+strip_ansi() {
+    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b\][^\x07]*\x07//g; s/\x1b[()][B0-2]//g; s/\x1b\[?[0-9;]*[hl]//g; s/\x0f//g; s/\r//g'
+}
+
+strip_control_chars() {
+    tr -d '\000-\007\016-\037' | sed 's/\x1b//g'
+}
+
+strip_markers() {
+    grep -v "^${LOG2AI_MARKER_PREFIX}" | grep -v "^${LOG2AI_MARKER_END}" || true
+}
+
+redact_secrets() {
+    sed -E \
+        -e 's/(export[[:space:]]+)?([A-Za-z_]*([Kk][Ee][Yy]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss]([Ww][Oo][Rr][Dd])?|PASSWD|DATABASE_URL|ACCESS_TOKEN|CLIENT_SECRET)[[:space:]]*=[[:space:]]*)([^[:space:]]+)/\1***REDACTED***/g' \
+        -e 's/(Authorization:[[:space:]]*)(Bearer|Basic)[[:space:]]+[^[:space:]]+/\1\2 ***REDACTED***/gI' \
+        -e 's/(Bearer|Basic)[[:space:]]+[A-Za-z0-9+\/=._~-]{20,}/\1 ***REDACTED***/g' \
+        -e 's/sk-[A-Za-z0-9]{20,}/***REDACTED***/g' \
+        -e 's/sk-ant-[A-Za-z0-9_-]{20,}/***REDACTED***/g' \
+        -e 's/ghp_[A-Za-z0-9]{36,}/***REDACTED***/g' \
+        -e 's/github_pat_[A-Za-z0-9_]{22,}/***REDACTED***/g' \
+        -e 's/AKIA[0-9A-Z]{16}/***REDACTED***/g' \
+        -e 's/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/***REDACTED***/g' \
+        -e 's/npm_[A-Za-z0-9]{36,}/***REDACTED***/g' \
+        -e 's|([a-zA-Z][a-zA-Z0-9+.-]*://)([^:]+):([^@]+)@|\1\2:***REDACTED***@|g' \
+        -e '/^-----BEGIN [A-Z ]*PRIVATE KEY-----$/,/^-----END [A-Z ]*PRIVATE KEY-----$/{
+            /^-----BEGIN/!{/^-----END/!s/.*/***REDACTED PRIVATE KEY***/;}
+        }'
+}
+
+strip_script_headers() {
+    grep -v '^Script started on ' | grep -v '^Script done on ' || true
+}
+
+process_log() {
+    strip_ansi | strip_control_chars | strip_markers | strip_script_headers | redact_secrets
+}
+
+extract_last_command() {
+    local log_file="$1"
+    local session_id="$2"
+    local sessions_dir
+    sessions_dir="$(log2ai_sessions_dir)"
+    local cmd_file="$sessions_dir/$session_id.cmd"
+
+    if [[ ! -f "$cmd_file" ]] || [[ ! -s "$cmd_file" ]]; then
+        return 1
+    fi
+
+    # Get last non-exit command from cmd file
+    local cmd_text=""
+    while IFS=$'\t' read -r _ts cmd; do
+        if [[ "$cmd" != "exit" ]]; then
+            cmd_text="$cmd"
+        fi
+    done < "$cmd_file"
+
+    if [[ -z "$cmd_text" ]]; then
+        return 1
+    fi
+
+    # script log structure:
+    #   [?2004h ... prompt ... $ <input editing> \n   <- command input line
+    #   [?2004l <output>                               <- output starts after [?2004l
+    #   [?2004h ... prompt ... $ <next cmd>            <- next command
+    #
+    # Strategy: find the second-to-last [?2004l marker (last command's output),
+    # extract text between it and the next [?2004h (next prompt).
+    # The .cmd file gives us the command text.
+
+    local raw
+    raw="$(cat "$log_file")"
+
+    # Find all line numbers with [?2004l (marks start of command output)
+    local output_markers
+    output_markers="$(echo "$raw" | grep -n '\[?2004l' | cut -d: -f1)"
+
+    if [[ -z "$output_markers" ]]; then
+        return 1
+    fi
+
+    # Count markers - we want the second-to-last one (last real command, not exit)
+    local marker_count target_line
+    marker_count="$(echo "$output_markers" | wc -l)"
+
+    if [[ "$marker_count" -lt 2 ]]; then
+        # Only one output marker - use it
+        target_line="$(echo "$output_markers" | tail -1)"
+    else
+        # Second to last = last real command output (last one is exit)
+        target_line="$(echo "$output_markers" | tail -2 | head -1)"
+    fi
+
+    # Find the next [?2004h line after target (marks next prompt)
+    local end_line
+    end_line="$(echo "$raw" | tail -n "+$((target_line + 1))" | grep -n '\[?2004h' | head -1 | cut -d: -f1)"
+
+    local output_raw
+    if [[ -n "$end_line" ]]; then
+        local actual_end=$((target_line + end_line - 1))
+        output_raw="$(echo "$raw" | sed -n "$((target_line)),$((actual_end - 1))p")"
+    else
+        output_raw="$(echo "$raw" | tail -n "+$target_line")"
+    fi
+
+    # Clean the extracted output
+    local output_clean
+    output_clean="$(echo "$output_raw" | strip_ansi | tr -d '\r' | tr -d '\000-\007\016-\037' | sed 's/\x1b//g' | strip_script_headers | sed '/^$/d')"
+
+    printf '$ %s\n' "$cmd_text"
+    if [[ -n "$output_clean" ]]; then
+        echo "$output_clean"
+    fi
+}
+
+cmd_start() {
+    check_wsl2
+    ensure_state_dirs
+
+    local script_bin=""
+    if [[ -x /usr/bin/script ]]; then
+        script_bin="/usr/bin/script"
+    elif command -v script >/dev/null 2>&1; then
+        script_bin="$(command -v script)"
+    else
+        die "'script' command not found. Install it with: sudo apt install bsdutils"
+    fi
+
+    local session_id
+    session_id="$(date '+%Y%m%d-%H%M%S')-$$"
+
+    local sessions_dir log_file meta_file
+    sessions_dir="$(log2ai_sessions_dir)"
+    log_file="$sessions_dir/$session_id.log"
+    meta_file="$sessions_dir/$session_id.meta"
+
+    touch "$log_file"
+    chmod 600 "$log_file"
+
+    cat > "$meta_file" <<EOF
+session_id=$session_id
+pid=$$
+started_at=$(date '+%Y-%m-%dT%H:%M:%S%:z')
+working_directory=$(pwd)
+log_file=$log_file
+status=active
+EOF
+    chmod 600 "$meta_file"
+
+    echo "$session_id" > "$(log2ai_state_dir)/latest"
+
+    cat <<EOF
+log2ai session started
+
+Session ID: $session_id
+Log file:   $log_file
+
+WARNING: Raw log may contain secrets. Use 'log2ai show' or 'log2ai copy' for redacted output.
+Type 'exit' or press Ctrl+D to stop.
+EOF
+
+    local init_script
+    init_script="$(mktemp "${TMPDIR:-/tmp}/log2ai-init.XXXXXX")"
+    trap 'rm -f "$init_script"' EXIT
+
+    local cmd_file="$sessions_dir/$session_id.cmd"
+    touch "$cmd_file"
+    chmod 600 "$cmd_file"
+
+    cat > "$init_script" <<INITEOF
+if [[ -f "\$HOME/.bashrc" ]]; then
+    source "\$HOME/.bashrc"
+fi
+
+__log2ai_log_file="$log_file"
+__log2ai_cmd_file="$cmd_file"
+__log2ai_cmd_running=0
+
+__log2ai_debug_trap() {
+    local cmd="\$BASH_COMMAND"
+    if [[ "\$cmd" == "__log2ai_prompt_hook" ]] || [[ "\$cmd" == *"__log2ai_"* ]] || [[ "\$cmd" == *"_mise_"* ]]; then
+        return
+    fi
+    if [[ \$__log2ai_cmd_running -eq 0 ]]; then
+        __log2ai_cmd_running=1
+        printf '%s\t%s\n' "\$(date +%s)" "\$cmd" >> "\$__log2ai_cmd_file"
+    fi
+}
+
+__log2ai_prompt_hook() {
+    __log2ai_cmd_running=0
+}
+
+trap '__log2ai_debug_trap' DEBUG
+PROMPT_COMMAND="__log2ai_prompt_hook\${PROMPT_COMMAND:+;\$PROMPT_COMMAND}"
+INITEOF
+
+    "$script_bin" -q "$log_file" -c "bash --rcfile '$init_script' -i"
+
+    rm -f "$init_script"
+    trap - EXIT
+
+    if [[ -f "$meta_file" ]]; then
+        sed -i "s/^status=active$/status=stopped/" "$meta_file"
+        echo "ended_at=$(date '+%Y-%m-%dT%H:%M:%S%:z')" >> "$meta_file"
+    fi
+
+    echo ""
+    echo "log2ai session stopped: $session_id"
+}
+
+cmd_list() {
+    ensure_state_dirs
+
+    local sessions_dir latest_id
+    sessions_dir="$(log2ai_sessions_dir)"
+    latest_id=""
+
+    local latest_file
+    latest_file="$(log2ai_state_dir)/latest"
+    if [[ -f "$latest_file" ]]; then
+        latest_id="$(cat "$latest_file" 2>/dev/null || echo "")"
+    fi
+
+    local meta_files
+    meta_files=("$sessions_dir"/*.meta)
+
+    if [[ ! -e "${meta_files[0]}" ]]; then
+        echo "No sessions found. Start one with: log2ai start"
+        return 0
+    fi
+
+    printf '%-28s %-10s %s\n' "SESSION ID" "STATUS" "STARTED AT"
+
+    for meta_file in "${meta_files[@]}"; do
+        local sid="" status="" started=""
+        while IFS='=' read -r key value; do
+            case "$key" in
+                session_id) sid="$value" ;;
+                status) status="$value" ;;
+                started_at) started="$value" ;;
+            esac
+        done < "$meta_file"
+
+        if [[ "$status" == "active" ]]; then
+            local pid_val=""
+            while IFS='=' read -r key value; do
+                if [[ "$key" == "pid" ]]; then
+                    pid_val="$value"
+                    break
+                fi
+            done < "$meta_file"
+            if [[ -n "$pid_val" ]] && ! kill -0 "$pid_val" 2>/dev/null; then
+                status="stopped"
+            fi
+        fi
+
+        local display_started
+        display_started="$(echo "$started" | sed 's/T/ /; s/+.*//' )"
+
+        local marker=""
+        if [[ "$sid" == "$latest_id" ]]; then
+            marker=" *"
+        fi
+
+        printf '%-28s %-10s %s%s\n' "$sid" "$status" "$display_started" "$marker"
+    done
+}
+
+cmd_show() {
+    local session_id="" show_all=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --session)
+                if [[ $# -lt 2 ]]; then
+                    die "--session requires a session ID value."
+                fi
+                session_id="$2"
+                shift 2
+                ;;
+            --all)
+                show_all=1
+                shift
+                ;;
+            *)
+                die "Unknown option: $1. See 'log2ai help'."
+                ;;
+        esac
+    done
+
+    session_id="$(resolve_session_id "$session_id")"
+    local log_file
+    log_file="$(get_log_file "$session_id")"
+
+    if [[ ! -f "$log_file" ]]; then
+        die "Log file not found for session: $session_id
+Run 'log2ai list' to see available sessions."
+    fi
+
+    if [[ ! -s "$log_file" ]]; then
+        die "Log file is empty for session: $session_id"
+    fi
+
+    if [[ $show_all -eq 1 ]]; then
+        process_log < "$log_file"
+    else
+        local extracted
+        if extracted="$(extract_last_command "$log_file" "$session_id")"; then
+            echo "$extracted" | process_log
+        else
+            err "WARNING: Could not find command boundary marker. Showing last 200 lines."
+            echo "---"
+            tail -200 "$log_file" | process_log
+        fi
+    fi
+}
+
+cmd_copy() {
+    check_clip_exe
+
+    local session_id="" show_all=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --session)
+                if [[ $# -lt 2 ]]; then
+                    die "--session requires a session ID value."
+                fi
+                session_id="$2"
+                shift 2
+                ;;
+            --all)
+                show_all=1
+                shift
+                ;;
+            *)
+                die "Unknown option: $1. See 'log2ai help'."
+                ;;
+        esac
+    done
+
+    session_id="$(resolve_session_id "$session_id")"
+    local log_file
+    log_file="$(get_log_file "$session_id")"
+
+    if [[ ! -f "$log_file" ]]; then
+        die "Log file not found for session: $session_id
+Run 'log2ai list' to see available sessions."
+    fi
+
+    if [[ ! -s "$log_file" ]]; then
+        die "Log file is empty for session: $session_id"
+    fi
+
+    local output mode
+
+    if [[ $show_all -eq 1 ]]; then
+        output="$(process_log < "$log_file")"
+        mode="full session"
+    else
+        local extracted
+        if extracted="$(extract_last_command "$log_file" "$session_id")"; then
+            output="$(echo "$extracted" | process_log)"
+            mode="last command"
+        else
+            err "WARNING: Could not find command boundary marker. Copying last 200 lines."
+            output="$(tail -200 "$log_file" | process_log)"
+            mode="last 200 lines (no command boundary found)"
+        fi
+    fi
+
+    if [[ -z "$output" ]]; then
+        die "No content to copy (log appears empty after processing)."
+    fi
+
+    printf '%s' "$output" | clip.exe
+
+    cat <<EOF
+Copied redacted log to Windows clipboard.
+Session: $session_id
+Mode: $mode
+EOF
+}
+
+cmd_help() {
+    cat <<'EOF'
+log2ai - Record terminal sessions and safely copy to clipboard
+
+Usage:
+  log2ai <command> [options]
+
+Commands:
+  start                Start recording a terminal session
+  list                 List recorded sessions
+  show [options]       Show session log (redacted)
+  copy [options]       Copy session log to Windows clipboard (redacted)
+  help                 Show this help
+  version              Show version
+
+Options for show/copy:
+  --session <ID>       Specify session ID (default: latest)
+  --all                Show/copy entire session (default: last command only)
+
+Examples:
+  log2ai start
+  log2ai list
+  log2ai show
+  log2ai show --session 20260712-201530-24873
+  log2ai show --all
+  log2ai copy --session 20260712-201530-24873
+EOF
+}
+
+cmd_version() {
+    echo "log2ai $LOG2AI_VERSION"
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        cmd_help
+        exit 0
+    fi
+
+    local command="$1"
+    shift
+
+    case "$command" in
+        start)   cmd_start "$@" ;;
+        list)    cmd_list "$@" ;;
+        show)    cmd_show "$@" ;;
+        copy)    cmd_copy "$@" ;;
+        help)    cmd_help "$@" ;;
+        version) cmd_version "$@" ;;
+        *)       die "Unknown command: $command. Run 'log2ai help' for usage." ;;
+    esac
+}
+
+main "$@"
