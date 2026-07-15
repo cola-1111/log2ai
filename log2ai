@@ -225,6 +225,14 @@ extract_last_command() {
 }
 
 cmd_start() {
+    local quiet=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -q|--quiet) quiet=1; shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
     check_wsl2
     ensure_state_dirs
 
@@ -260,15 +268,9 @@ EOF
 
     echo "$session_id" > "$(log2ai_state_dir)/latest"
 
-    cat <<EOF
-log2ai session started
-
-Session ID: $session_id
-Log file:   $log_file
-
-WARNING: Raw log may contain secrets. Use 'log2ai show' or 'log2ai copy' for redacted output.
-Type 'exit' or press Ctrl+D to stop.
-EOF
+    if [[ $quiet -eq 0 ]]; then
+        printf 'log2ai: recording session %s\n' "$session_id"
+    fi
 
     local init_script
     init_script="$(mktemp "${TMPDIR:-/tmp}/log2ai-init.XXXXXX")"
@@ -279,6 +281,8 @@ EOF
     chmod 600 "$cmd_file"
 
     cat > "$init_script" <<INITEOF
+export LOG2AI_SESSION="$session_id"
+
 if [[ -f "\$HOME/.bashrc" ]]; then
     source "\$HOME/.bashrc"
 fi
@@ -316,8 +320,10 @@ INITEOF
         echo "ended_at=$(date '+%Y-%m-%dT%H:%M:%S%:z')" >> "$meta_file"
     fi
 
-    echo ""
-    echo "log2ai session stopped: $session_id"
+    if [[ $quiet -eq 0 ]]; then
+        echo ""
+        echo "log2ai session stopped: $session_id"
+    fi
 }
 
 cmd_list() {
@@ -502,12 +508,15 @@ Usage:
   log2ai <command> [options]
 
 Commands:
-  start                Start recording a terminal session
+  start [options]      Start recording a terminal session
   list                 List recorded sessions
   show [options]       Show session log (redacted)
   copy [options]       Copy session log to Windows clipboard (redacted)
   help                 Show this help
   version              Show version
+
+Options for start:
+  -q, --quiet          Suppress start/stop messages
 
 Options for show/copy:
   --session <ID>       Specify session ID (default: latest)
