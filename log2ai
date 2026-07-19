@@ -4,6 +4,7 @@ set -euo pipefail
 readonly LOG2AI_VERSION="0.1.0"
 readonly LOG2AI_MARKER_PREFIX="__LOG2AI_COMMAND_START__"
 readonly LOG2AI_MARKER_END="__LOG2AI_COMMAND_END__"
+readonly LOG2AI_RETENTION_DAYS=30
 
 log2ai_state_dir() {
     echo "${XDG_STATE_HOME:-$HOME/.local/state}/log2ai"
@@ -224,9 +225,22 @@ extract_last_command() {
     fi
 }
 
+cleanup_old_sessions() {
+    local sessions_dir
+    sessions_dir="$(log2ai_sessions_dir)"
+
+    if [[ ! -d "$sessions_dir" ]]; then
+        return 0
+    fi
+
+    find "$sessions_dir" -type f \( -name "*.log" -o -name "*.meta" -o -name "*.cmd" \) \
+        -mtime "+${LOG2AI_RETENTION_DAYS}" -delete 2>/dev/null || true
+}
+
 cmd_start() {
     check_wsl2
     ensure_state_dirs
+    cleanup_old_sessions
 
     local script_bin=""
     if [[ -x /usr/bin/script ]]; then
