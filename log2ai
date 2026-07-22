@@ -159,11 +159,19 @@ extract_last_command() {
         return 1
     fi
 
-    # Get last non-exit command from cmd file
-    local cmd_text=""
-    while IFS=$'\t' read -r _ts cmd; do
-        if [[ "$cmd" != "exit" ]]; then
-            cmd_text="$cmd"
+    # .cmd format: timestamp\toffset\tcommand (new) or timestamp\tcommand (old)
+    local cmd_text="" cmd_offset=""
+    while IFS=$'\t' read -r _ts field2 field3; do
+        if [[ -n "$field3" ]]; then
+            if [[ "$field3" != "exit" ]]; then
+                cmd_text="$field3"
+                cmd_offset="$field2"
+            fi
+        else
+            if [[ "$field2" != "exit" ]]; then
+                cmd_text="$field2"
+                cmd_offset=""
+            fi
         fi
     done < "$cmd_file"
 
@@ -171,53 +179,77 @@ extract_last_command() {
         return 1
     fi
 
-    # script log structure:
-    #   [?2004h ... prompt ... $ <input editing> \n   <- command input line
-    #   [?2004l <output>                               <- output starts after [?2004l
-    #   [?2004h ... prompt ... $ <next cmd>            <- next command
-    #
-    # Strategy: find the second-to-last [?2004l marker (last command's output),
-    # extract text between it and the next [?2004h (next prompt).
-    # The .cmd file gives us the command text.
+    local output_section=""
 
-    local raw
-    raw="$(cat "$log_file")"
+    if [[ -n "$cmd_offset" ]]; then
+        local file_size
+        file_size="$(stat -c%s "$log_file" 2>/dev/null || stat -f%z "$log_file" 2>/dev/null)"
+        local remaining=$((file_size - cmd_offset))
 
-    # Find all line numbers with [?2004l (marks start of command output)
-    local output_markers
-    output_markers="$(echo "$raw" | grep -n '\[?2004l' | cut -d: -f1)"
+        if [[ "$remaining" -le 0 ]]; then
+            return 1
+        fi
 
-    if [[ -z "$output_markers" ]]; then
+        if [[ "$remaining" -gt 5242880 ]]; then
+            remaining=5242880
+        fi
+
+        output_section="$(tail -c +"$((cmd_offset + 1))" "$log_file" | head -c "$remaining")"
+    else
+        # Old format fallback: byte-based marker search
+        local tail_bytes=5242880
+        local file_size
+        file_size="$(stat -c%s "$log_file" 2>/dev/null || stat -f%z "$log_file" 2>/dev/null)"
+
+        local chunk_file
+        chunk_file="$(mktemp "${TMPDIR:-/tmp}/log2ai-chunk.XXXXXX")"
+
+        if [[ "$file_size" -le "$tail_bytes" ]]; then
+            cp "$log_file" "$chunk_file"
+        else
+            tail -c "$tail_bytes" "$log_file" > "$chunk_file"
+        fi
+
+        local marker_offsets
+        marker_offsets="$(grep -ob '\[?2004l' "$chunk_file" | cut -d: -f1)"
+
+        if [[ -z "$marker_offsets" ]]; then
+            rm -f "$chunk_file"
+            return 1
+        fi
+
+        local marker_count start_offset
+        marker_count="$(echo "$marker_offsets" | wc -l)"
+
+        if [[ "$marker_count" -ge 2 ]]; then
+            start_offset="$(echo "$marker_offsets" | tail -2 | head -1)"
+        else
+            start_offset="$(echo "$marker_offsets" | tail -1)"
+        fi
+
+        start_offset=$((start_offset + 7))
+
+        local chunk_size end_offset
+        chunk_size="$(stat -c%s "$chunk_file" 2>/dev/null || stat -f%z "$chunk_file" 2>/dev/null)"
+        local remaining=$((chunk_size - start_offset))
+
+        end_offset="$(tail -c "$remaining" "$chunk_file" | grep -ob '\[?2004h' | head -1 | cut -d: -f1)"
+
+        if [[ -n "$end_offset" ]]; then
+            output_section="$(tail -c "$remaining" "$chunk_file" | head -c "$end_offset")"
+        else
+            output_section="$(tail -c "$remaining" "$chunk_file")"
+        fi
+
+        rm -f "$chunk_file"
+    fi
+
+    if [[ -z "$output_section" ]]; then
         return 1
     fi
 
-    # Count markers - we want the second-to-last one (last real command, not exit)
-    local marker_count target_line
-    marker_count="$(echo "$output_markers" | wc -l)"
-
-    if [[ "$marker_count" -lt 2 ]]; then
-        # Only one output marker - use it
-        target_line="$(echo "$output_markers" | tail -1)"
-    else
-        # Second to last = last real command output (last one is exit)
-        target_line="$(echo "$output_markers" | tail -2 | head -1)"
-    fi
-
-    # Find the next [?2004h line after target (marks next prompt)
-    local end_line
-    end_line="$(echo "$raw" | tail -n "+$((target_line + 1))" | grep -n '\[?2004h' | head -1 | cut -d: -f1)"
-
-    local output_raw
-    if [[ -n "$end_line" ]]; then
-        local actual_end=$((target_line + end_line - 1))
-        output_raw="$(echo "$raw" | sed -n "$((target_line)),$((actual_end - 1))p")"
-    else
-        output_raw="$(echo "$raw" | tail -n "+$target_line")"
-    fi
-
-    # Clean the extracted output
     local output_clean
-    output_clean="$(echo "$output_raw" | strip_ansi | tr -d '\r' | tr -d '\000-\007\016-\037' | sed 's/\x1b//g' | strip_script_headers | sed '/^$/d')"
+    output_clean="$(printf '%s' "$output_section" | strip_ansi | tr -d '\r' | tr -d '\000-\007\016-\037' | sed 's/\x1b//g' | strip_script_headers | redact_secrets | sed '/^$/d')"
 
     printf '$ %s\n' "$cmd_text"
     if [[ -n "$output_clean" ]]; then
@@ -352,7 +384,9 @@ __log2ai_debug_trap() {
     fi
     if [[ \$__log2ai_cmd_running -eq 0 ]]; then
         __log2ai_cmd_running=1
-        printf '%s\t%s\n' "\$(date +%s)" "\$cmd" >> "\$__log2ai_cmd_file"
+        local __log2ai_offset
+        __log2ai_offset="\$(stat -c%s "\$__log2ai_log_file" 2>/dev/null || echo 0)"
+        printf '%s\t%s\t%s\n' "\$(date +%s)" "\$__log2ai_offset" "\$cmd" >> "\$__log2ai_cmd_file"
     fi
 }
 
@@ -478,11 +512,11 @@ Run 'log2ai list' to see available sessions."
     else
         local extracted
         if extracted="$(extract_last_command "$log_file" "$session_id")"; then
-            echo "$extracted" | process_log
+            echo "$extracted"
         else
-            err "WARNING: Could not find command boundary marker. Showing last 200 lines."
+            err "WARNING: Could not find command boundary marker. Showing tail of log."
             echo "---"
-            tail -200 "$log_file" | process_log
+            tail -c 524288 "$log_file" | process_log
         fi
     fi
 }
@@ -532,12 +566,12 @@ Run 'log2ai list' to see available sessions."
     else
         local extracted
         if extracted="$(extract_last_command "$log_file" "$session_id")"; then
-            output="$(echo "$extracted" | process_log)"
+            output="$extracted"
             mode="last command"
         else
-            err "WARNING: Could not find command boundary marker. Copying last 200 lines."
-            output="$(tail -200 "$log_file" | process_log)"
-            mode="last 200 lines (no command boundary found)"
+            err "WARNING: Could not find command boundary marker. Copying tail of log."
+            output="$(tail -c 524288 "$log_file" | process_log)"
+            mode="tail (no command boundary found)"
         fi
     fi
 
